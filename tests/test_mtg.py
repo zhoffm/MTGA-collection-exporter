@@ -207,6 +207,56 @@ def test_save_cache_writes_current_version(tmp_path):
     assert mtg.DatabaseLoader(cfg)._load_cache()[1000].rarity == "common"
 
 
+def test_meta_file_keeps_both_etag_and_cache_version(tmp_path):
+    cfg = mtg.Config(
+        output_dir=tmp_path,
+        lookup_file=tmp_path / "arena_id_lookup.json",
+        cache_meta_file=tmp_path / "arena_id_lookup.meta.json",
+    )
+    loader = mtg.DatabaseLoader(cfg)
+    loader._save_etag('"abc"')
+    loader._save_cache({i: mtg.CardInfo(i, f"Card{i}") for i in range(1000, 1150)})
+    assert loader._load_etag() == '"abc"'
+    assert loader._read_cache_version() == mtg.CACHE_VERSION
+    loader._save_etag('"def"')
+    assert loader._load_etag() == '"def"'
+    assert loader._read_cache_version() == mtg.CACHE_VERSION
+
+
+def test_scryfall_304_without_usable_cache_refetches(tmp_path, monkeypatch):
+    cfg = _write_cache(tmp_path, mtg.CACHE_VERSION - 1)  # outdated -> unusable
+    loader = mtg.DatabaseLoader(cfg)
+    loader._save_etag('"stale"')
+
+    class Resp:
+        def __init__(self, status, payload=None):
+            self.status_code = status
+            self._payload = payload
+            self.headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    calls = []
+
+    class Session:
+        def get(self, url, timeout=None, headers=None):
+            calls.append(headers)
+            if url == loader.SCRYFALL_BULK_URL:
+                return Resp(200, {"download_uri": "https://example.invalid/cards.json"})
+            if headers and "If-None-Match" in headers:
+                return Resp(304)
+            return Resp(200, [{"arena_id": 42, "name": "Fresh Card", "set": "abc"}])
+
+    monkeypatch.setattr(mtg.DatabaseLoader, "_http_session", staticmethod(lambda: Session()))
+    result = loader._fetch_scryfall()
+    assert result[42].name == "Fresh Card"
+    assert calls[-1] in (None, {})
+
+
 # --------------------------------------------------------------------------
 # anchor printing selection
 # --------------------------------------------------------------------------
