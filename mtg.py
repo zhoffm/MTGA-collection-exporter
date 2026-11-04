@@ -629,12 +629,24 @@ class DatabaseLoader:
 
         return result if len(result) > 100 else None
 
-    def _read_cache_version(self) -> Optional[int]:
+    def _read_meta(self) -> Dict[str, Any]:
         try:
             with self.cfg.cache_meta_file.open("r", encoding="utf-8") as f:
-                return json.load(f).get("version")
+                meta = json.load(f)
+            return meta if isinstance(meta, dict) else {}
         except Exception:
-            return None
+            return {}
+
+    def _update_meta(self, **fields: Any) -> None:
+        """Merge fields into the meta file. It holds both the cache schema
+        version and the Scryfall ETag, so a plain overwrite loses one of them."""
+        meta = self._read_meta()
+        meta.update(fields)
+        with self.cfg.cache_meta_file.open("w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+    def _read_cache_version(self) -> Optional[int]:
+        return self._read_meta().get("version")
 
     def _save_cache(self, lookup: Dict[int, CardInfo]) -> None:
         try:
@@ -653,8 +665,7 @@ class DatabaseLoader:
             }
             with self.cfg.lookup_file.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
-            with self.cfg.cache_meta_file.open("w", encoding="utf-8") as f:
-                json.dump({"version": CACHE_VERSION, "cards": len(lookup)}, f)
+            self._update_meta(version=CACHE_VERSION, cards=len(lookup))
             self.log.info("Cache saved → %s", self.cfg.lookup_file)
         except Exception as exc:
             self.log.warning("Cache save failed: %s", exc)
@@ -862,8 +873,14 @@ class DatabaseLoader:
 
             resp = session.get(uri, timeout=300, headers=headers)
             if resp.status_code == 304:
-                self.log.info("Scryfall unchanged (304) — using cache")
-                return self._load_cache() or {}
+                cached = self._load_cache()
+                if cached:
+                    self.log.info("Scryfall unchanged (304) — using cache")
+                    return cached
+                # The ETag outlived a usable cache (expired, outdated schema,
+                # or deleted), so a 304 leaves nothing to load. Refetch in full.
+                self.log.info("Scryfall unchanged (304) but no usable cache — refetching")
+                resp = session.get(uri, timeout=300)
 
             resp.raise_for_status()
             new_etag = resp.headers.get("ETag")
@@ -927,18 +944,11 @@ class DatabaseLoader:
         return s
 
     def _load_etag(self) -> Optional[str]:
-        try:
-            if self.cfg.cache_meta_file.exists():
-                with self.cfg.cache_meta_file.open("r") as f:
-                    return json.load(f).get("scryfall_etag")
-        except Exception:
-            return None
-        return None
+        return self._read_meta().get("scryfall_etag")
 
     def _save_etag(self, etag: str) -> None:
         try:
-            with self.cfg.cache_meta_file.open("w") as f:
-                json.dump({"scryfall_etag": etag, "saved_at": datetime.now().isoformat()}, f)
+            self._update_meta(scryfall_etag=etag, saved_at=datetime.now().isoformat())
         except Exception:
             pass
 
